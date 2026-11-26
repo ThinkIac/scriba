@@ -2,10 +2,12 @@ import RecordProxy from "./RecordProxy.js";
 import { randomUUID } from "crypto";
 
 class TableProxy {
-	constructor(db, modelName, fields, scriba, tenantId) {
+	constructor(db, modelName, fields, scriba, tenantId, declaredPrimaryKey, enums) {
 		this._db = db;
 		this._modelName = modelName;
 		this._fields = fields;
+		this._declaredPrimaryKey = declaredPrimaryKey;
+		this._enums = enums;
 		this._primaryKey = fields.find(field => field.isId)?.name || "id";
 		this._records = Object.create(null);
 		this._relations = {};
