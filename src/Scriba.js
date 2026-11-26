@@ -131,6 +131,7 @@ class Scriba {
     const { models, enums } = loadPrismaModels(schemaPath);
 
     for (const [modelName, def] of Object.entries(models)) {
+      def.primaryKey ??= null;
       const hasId = def.fields.some(f => f.isId || f.name === "id");
       if (!hasId) {
         def.fields.unshift({
@@ -192,9 +193,14 @@ class Scriba {
       }
 
       this._createUniqueIndexes(t.db, modelName, def);
+      if (def.primaryKey?.composite) {
+        const columns = def.primaryKey.fields.map(quoteIdentifier).join(', ');
+        const index = quoteIdentifier('pk_' + uniqueIndexName(modelName, def.primaryKey.fields));
+        t.db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS ${index} ON ${quoteIdentifier(modelName)} (${columns})`).run();
+      }
 
       // Cria TableProxy
-      t.tables[modelName.toLowerCase()] = new TableProxy(t.db, modelName, def.fields, this, tenantId);
+      t.tables[modelName.toLowerCase()] = new TableProxy(t.db, modelName, def.fields, this, tenantId, def.primaryKey, enums);
     }
 
     // Detecta relações
@@ -262,6 +268,42 @@ class Scriba {
     const tenant = this._tenants[tenantId];
     if (!tenant) console.log(tenantId) // throw Error(`Tenant ${tenantId} não encontrado`);
     return tenant.tables[name.toLowerCase()];
+  }
+
+  /** Reads the declared key from this tenant's connection without exposing a RecordProxy. */
+  readByPrimaryKey(tenantId, modelName, key, projection) {
+    const tenant = Object.hasOwn(this._tenants, tenantId) && this._tenants[tenantId];
+    const table = tenant && Object.hasOwn(tenant.tables, modelName.toLowerCase()) && tenant.tables[modelName.toLowerCase()];
+    const invalid = () => Object.assign(new TypeError(`Invalid primary key for ${modelName}`), { code: 'SCRIBA_INVALID_KEY' });
+    if (!table || table._modelName !== modelName || !table._declaredPrimaryKey) throw invalid();
+    const fields = table._declaredPrimaryKey.fields;
+    if (!key || Reflect.ownKeys(key).length !== fields.length || fields.some(field => !Object.hasOwn(key, field))) throw invalid();
+    const params = fields.map(field => {
+      const value = Object.getOwnPropertyDescriptor(key, field)?.value;
+      const { type } = table._fields.find(column => column.name === field);
+      const enumeration = table._enums[type];
+      const valid = enumeration ? enumeration.includes(value)
+        : type === 'Int' ? Number.isSafeInteger(value)
+        : type === 'Float' ? Number.isFinite(value)
+        : type === 'Boolean' ? typeof value === 'boolean'
+        : (type === 'String' || type === 'DateTime') && typeof value === 'string';
+      if (!valid) throw invalid();
+      return table._bindValue(field, value);
+    });
+    if (!Array.isArray(projection) || !projection.length || projection.some(field => !table._fields.some(column => column.name === field))) {
+      throw new TypeError(`Invalid projection for ${modelName}`);
+    }
+    const where = fields.map(field => `${quoteIdentifier(field)} = ?`);
+    if (table._hasSoftDelete()) where.push('"deletedAt" IS NULL');
+    const columns = projection.map(quoteIdentifier).join(', ');
+    const row = tenant.db.prepare(`SELECT ${columns} FROM ${quoteIdentifier(modelName)} WHERE ${where.join(' AND ')} LIMIT 1`).get(...params);
+    if (!row) return null;
+    for (const { name, type } of table._fields) {
+      if (!Object.hasOwn(row, name) || row[name] == null) continue;
+      if (type === 'Boolean') row[name] = Boolean(row[name]);
+      if (type === 'Json') row[name] = JSON.parse(row[name]);
+    }
+    return row;
   }
 
   // Optional document API. Reuses the tenant's existing connection (including
